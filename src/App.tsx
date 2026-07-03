@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Github, Rocket, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy } from "lucide-react";
 
-type Status = "idle" | "copying" | "deploying" | "done" | "error";
+type Status = "idle" | "copying" | "done" | "error";
 
 interface Result {
   copiedRepo: string;
@@ -56,7 +56,7 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   }
 
-  const isLoading = status === "copying" || status === "deploying";
+  const isLoading = status === "copying";
 
   return (
     <div className="min-h-screen bg-[#0d1117] text-white flex flex-col items-center justify-center px-4">
@@ -142,7 +142,7 @@ export default function App() {
             {isLoading ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                {status === "copying" ? "Copying repository…" : "Deploying to Vercel…"}
+                Copying repository &amp; setting up Vercel…
               </>
             ) : (
               <>
@@ -155,8 +155,8 @@ export default function App() {
           {/* Progress Steps */}
           {isLoading && (
             <div className="mt-5 space-y-2">
-              <Step active={status === "copying"} done={false} label="Cloning source repository & pushing to target" />
-              <Step active={status === "deploying"} done={false} label="Deploying to Vercel" />
+              <Step active label="Copying files from source → target repo" />
+              <Step active={false} label="Creating Vercel project & triggering deployment" />
             </div>
           )}
 
@@ -165,8 +165,9 @@ export default function App() {
             <div className="mt-5 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
               <div className="flex items-center gap-2 mb-3">
                 <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span className="text-sm font-semibold text-emerald-400">Done! Repo copied & deployed</span>
+                <span className="text-sm font-semibold text-emerald-400">Repo copied! Vercel deployment in progress…</span>
               </div>
+              <p className="text-xs text-white/30 mb-3">The live URL will be active within a few minutes once Vercel finishes building.</p>
               <ResultRow
                 label="GitHub Repo"
                 url={result.copiedRepo}
@@ -206,12 +207,10 @@ export default function App() {
   );
 }
 
-function Step({ active, done, label }: { active: boolean; done: boolean; label: string }) {
+function Step({ active, label }: { active: boolean; label: string }) {
   return (
     <div className={`flex items-center gap-2.5 text-xs transition-opacity ${active ? "opacity-100" : "opacity-40"}`}>
-      {done ? (
-        <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-      ) : active ? (
+      {active ? (
         <Loader2 className="w-3.5 h-3.5 text-purple-400 animate-spin shrink-0" />
       ) : (
         <div className="w-3.5 h-3.5 rounded-full border border-white/20 shrink-0" />
