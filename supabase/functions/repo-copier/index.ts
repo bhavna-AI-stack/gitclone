@@ -20,34 +20,82 @@ function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
   }
 }
 
-async function ghGet(path: string, token?: string) {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`https://api.github.com${path}`, { headers });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub GET ${path} failed ${res.status}: ${text}`);
-  }
-  return res.json();
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function ghPost(path: string, body: unknown, token: string) {
+async function ghRequest(
+  method: string,
+  path: string,
+  token: string,
+  body?: unknown
+): Promise<{ ok: boolean; status: number; data: unknown }> {
   const res = await fetch(`https://api.github.com${path}`, {
-    method: "POST",
+    method,
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
     },
-    body: JSON.stringify(body),
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(`GitHub POST ${path} failed ${res.status}: ${JSON.stringify(data)}`);
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function ghGet(path: string, token: string): Promise<unknown> {
+  const { ok, status, data } = await ghRequest("GET", path, token);
+  if (!ok) throw new Error(`GET ${path} → ${status}: ${JSON.stringify(data)}`);
   return data;
+}
+
+async function ghPost(path: string, body: unknown, token: string): Promise<unknown> {
+  const { ok, status, data } = await ghRequest("POST", path, token, body);
+  if (!ok) throw new Error(`POST ${path} → ${status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+async function ghPatch(path: string, body: unknown, token: string): Promise<unknown> {
+  const { ok, status, data } = await ghRequest("PATCH", path, token, body);
+  if (!ok) throw new Error(`PATCH ${path} → ${status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+async function ghPut(path: string, body: unknown, token: string): Promise<unknown> {
+  const { ok, status, data } = await ghRequest("PUT", path, token, body);
+  if (!ok) throw new Error(`PUT ${path} → ${status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+/** Returns true if the repo has at least one git ref (i.e. is not empty). */
+async function repoHasCommits(owner: string, repo: string, token: string): Promise<boolean> {
+  const { ok, data } = await ghRequest("GET", `/repos/${owner}/${repo}/git/refs`, token);
+  if (!ok) return false;
+  return Array.isArray(data) && (data as unknown[]).length > 0;
+}
+
+/**
+ * Seed an empty repo with a single placeholder commit so GitHub's git backend
+ * is fully initialized before we push blobs/trees.
+ */
+async function seedEmptyRepo(
+  owner: string,
+  repo: string,
+  branch: string,
+  token: string
+): Promise<void> {
+  await ghPut(
+    `/repos/${owner}/${repo}/contents/.gitkeep`,
+    {
+      message: "Initialize repository",
+      content: btoa(""),
+      branch,
+    },
+    token
+  );
+  // Let GitHub propagate the new ref
+  await sleep(2000);
 }
 
 async function copyRepo(
@@ -57,109 +105,125 @@ async function copyRepo(
   dstRepo: string,
   token: string
 ): Promise<void> {
-  // Get source repo default branch
-  const srcInfo = await ghGet(`/repos/${srcOwner}/${srcRepo}`, token);
+  // ── 1. Read source ──────────────────────────────────────────────────────
+  const srcInfo = await ghGet(`/repos/${srcOwner}/${srcRepo}`, token) as Record<string, string>;
   const defaultBranch: string = srcInfo.default_branch ?? "main";
 
-  // Get latest commit SHA on default branch
-  const refData = await ghGet(`/repos/${srcOwner}/${srcRepo}/git/ref/heads/${defaultBranch}`, token);
-  const commitSha: string = refData.object.sha;
+  const refData = await ghGet(
+    `/repos/${srcOwner}/${srcRepo}/git/ref/heads/${defaultBranch}`,
+    token
+  ) as { object: { sha: string } };
+  const commitSha = refData.object.sha;
 
-  // Get commit to find tree SHA
-  const commitData = await ghGet(`/repos/${srcOwner}/${srcRepo}/git/commits/${commitSha}`, token);
-  const treeSha: string = commitData.tree.sha;
+  const commitData = await ghGet(
+    `/repos/${srcOwner}/${srcRepo}/git/commits/${commitSha}`,
+    token
+  ) as { tree: { sha: string } };
+  const treeSha = commitData.tree.sha;
 
-  // Get full recursive tree
   const treeData = await ghGet(
     `/repos/${srcOwner}/${srcRepo}/git/trees/${treeSha}?recursive=1`,
     token
-  );
-  const items: Array<{ path: string; type: string; sha: string; mode: string }> = treeData.tree;
+  ) as { tree: Array<{ path: string; type: string; sha: string; mode: string }> };
+  const items = treeData.tree;
 
-  // Check if target repo already exists; create if not
-  try {
-    await ghGet(`/repos/${dstOwner}/${dstRepo}`, token);
-  } catch {
-    // Repo doesn't exist — create it
-    // Try user repo first, then org
+  // ── 2. Ensure target repo exists and is initialized ─────────────────────
+  const repoCheck = await ghRequest("GET", `/repos/${dstOwner}/${dstRepo}`, token);
+
+  if (!repoCheck.ok) {
+    // Create repo with auto_init so GitHub sets up the git backend immediately
     try {
-      await ghPost(`/user/repos`, { name: dstRepo, private: false, auto_init: false }, token);
+      await ghPost(`/user/repos`, { name: dstRepo, private: false, auto_init: true }, token);
     } catch {
-      await ghPost(`/orgs/${dstOwner}/repos`, { name: dstRepo, private: false, auto_init: false }, token);
+      await ghPost(`/orgs/${dstOwner}/repos`, { name: dstRepo, private: false, auto_init: true }, token);
     }
-    // Give GitHub a moment to provision
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleep(3000); // Wait for GitHub to provision the git backend
+  } else {
+    // Repo exists — make sure it has at least one commit
+    const hasCommits = await repoHasCommits(dstOwner, dstRepo, token);
+    if (!hasCommits) {
+      // Get the default branch that GitHub assigned to this repo
+      const dstInfo = await ghGet(`/repos/${dstOwner}/${dstRepo}`, token) as Record<string, string>;
+      const dstDefault = dstInfo.default_branch ?? defaultBranch;
+      await seedEmptyRepo(dstOwner, dstRepo, dstDefault, token);
+    }
   }
 
-  // Build new tree entries — copy blobs from source into destination
-  const newTreeEntries: Array<{ path: string; mode: string; type: string; sha?: string; content?: string }> = [];
+  // Get the actual default branch of the target repo (may differ after auto_init)
+  const dstInfo = await ghGet(`/repos/${dstOwner}/${dstRepo}`, token) as Record<string, string>;
+  const dstBranch: string = dstInfo.default_branch ?? defaultBranch;
+
+  // ── 3. Copy blobs from source → destination ──────────────────────────────
+  const newTreeEntries: Array<{
+    path: string;
+    mode: string;
+    type: string;
+    sha: string;
+  }> = [];
 
   for (const item of items) {
     if (item.type === "blob") {
-      // Fetch blob content from source
-      const blob = await ghGet(`/repos/${srcOwner}/${srcRepo}/git/blobs/${item.sha}`, token);
-      // Create blob in destination
+      const blob = await ghGet(
+        `/repos/${srcOwner}/${srcRepo}/git/blobs/${item.sha}`,
+        token
+      ) as { content: string; encoding: string };
+
       const newBlob = await ghPost(
         `/repos/${dstOwner}/${dstRepo}/git/blobs`,
         { content: blob.content, encoding: blob.encoding },
         token
-      );
+      ) as { sha: string };
+
       newTreeEntries.push({
         path: item.path,
-        mode: item.mode as string,
+        mode: item.mode,
         type: "blob",
         sha: newBlob.sha,
       });
-    } else if (item.type === "tree") {
-      newTreeEntries.push({ path: item.path, mode: item.mode as string, type: "tree", sha: item.sha });
     }
+    // Skip "tree" entries — the Create Tree API builds subtrees automatically
   }
 
-  // Create new tree in destination
-  const newTree = await ghPost(`/repos/${dstOwner}/${dstRepo}/git/trees`, { tree: newTreeEntries }, token);
+  // ── 4. Create tree ───────────────────────────────────────────────────────
+  const newTree = await ghPost(
+    `/repos/${dstOwner}/${dstRepo}/git/trees`,
+    { tree: newTreeEntries },
+    token
+  ) as { sha: string };
 
-  // Create commit in destination
+  // ── 5. Create commit (parent = current HEAD of dst branch) ───────────────
   let parentShas: string[] = [];
-  try {
-    const dstRef = await ghGet(`/repos/${dstOwner}/${dstRepo}/git/ref/heads/${defaultBranch}`, token);
-    parentShas = [dstRef.object.sha];
-  } catch {
-    // No commits yet — orphan commit
+  const refCheck = await ghRequest("GET", `/repos/${dstOwner}/${dstRepo}/git/ref/heads/${dstBranch}`, token);
+  if (refCheck.ok) {
+    const refObj = refCheck.data as { object: { sha: string } };
+    parentShas = [refObj.object.sha];
   }
 
-  const newCommit = await ghPost(`/repos/${dstOwner}/${dstRepo}/git/commits`, {
-    message: `Copy from ${srcOwner}/${srcRepo}`,
-    tree: newTree.sha,
-    parents: parentShas,
-  }, token);
+  const newCommit = await ghPost(
+    `/repos/${dstOwner}/${dstRepo}/git/commits`,
+    {
+      message: `Copy from ${srcOwner}/${srcRepo}`,
+      tree: newTree.sha,
+      parents: parentShas,
+    },
+    token
+  ) as { sha: string };
 
-  // Update or create branch reference
-  try {
-    await ghGet(`/repos/${dstOwner}/${dstRepo}/git/ref/heads/${defaultBranch}`, token);
-    // Reference exists — force update
-    const res = await fetch(
-      `https://api.github.com/repos/${dstOwner}/${dstRepo}/git/refs/heads/${defaultBranch}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "Content-Type": "application/json",
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-        body: JSON.stringify({ sha: newCommit.sha, force: true }),
-      }
+  // ── 6. Update or create branch ref ──────────────────────────────────────
+  if (refCheck.ok) {
+    // Ref exists → force-update it
+    await ghPatch(
+      `/repos/${dstOwner}/${dstRepo}/git/refs/heads/${dstBranch}`,
+      { sha: newCommit.sha, force: true },
+      token
     );
-    if (!res.ok) {
-      const t = await res.text();
-      throw new Error(`PATCH ref failed ${res.status}: ${t}`);
-    }
-  } catch {
-    // Reference doesn't exist — create it
-    await ghPost(`/repos/${dstOwner}/${dstRepo}/git/refs`, {
-      ref: `refs/heads/${defaultBranch}`,
-      sha: newCommit.sha,
-    }, token);
+  } else {
+    // Ref doesn't exist → create it
+    await ghPost(
+      `/repos/${dstOwner}/${dstRepo}/git/refs`,
+      { ref: `refs/heads/${dstBranch}`, sha: newCommit.sha },
+      token
+    );
   }
 }
 
@@ -168,9 +232,12 @@ async function deployToVercel(
   dstRepo: string,
   vercelToken: string
 ): Promise<string> {
-  const projectName = `${dstRepo}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  const projectName = `${dstRepo}-${Date.now()}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .slice(0, 52);
 
-  // Create Vercel project linked to GitHub repo
+  // Create a Vercel project linked to the GitHub repo
   const createRes = await fetch("https://api.vercel.com/v9/projects", {
     method: "POST",
     headers: {
@@ -186,28 +253,30 @@ async function deployToVercel(
     }),
   });
 
-  const project = await createRes.json();
+  const project = await createRes.json() as Record<string, unknown>;
   if (!createRes.ok) throw new Error(`Vercel create project failed: ${JSON.stringify(project)}`);
 
-  const projectId: string = project.id;
+  const projectId = project.id as string;
 
-  // Poll for the first deployment
+  // Poll up to 150 s for the deployment to reach READY
   for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
+    await sleep(5000);
     const deplRes = await fetch(
       `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=1`,
       { headers: { Authorization: `Bearer ${vercelToken}` } }
     );
-    const deplData = await deplRes.json();
-    const deployments: Array<{ state: string; url: string }> = deplData.deployments ?? [];
+    const deplData = await deplRes.json() as { deployments?: Array<{ state: string; url: string }> };
+    const deployments = deplData.deployments ?? [];
     if (deployments.length > 0) {
       const d = deployments[0];
       if (d.state === "READY") return `https://${d.url}`;
-      if (d.state === "ERROR" || d.state === "CANCELED") throw new Error(`Vercel deployment ${d.state}`);
+      if (d.state === "ERROR" || d.state === "CANCELED") {
+        throw new Error(`Vercel deployment ended with state: ${d.state}`);
+      }
     }
   }
 
-  // Return project URL even if deploy isn't done yet
+  // Return a predictable project URL if polling times out
   return `https://${projectName}.vercel.app`;
 }
 
@@ -217,7 +286,10 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { sourceUrl, targetUrl } = await req.json();
+    const { sourceUrl, targetUrl } = await req.json() as {
+      sourceUrl?: string;
+      targetUrl?: string;
+    };
 
     if (!sourceUrl || !targetUrl) {
       return new Response(
@@ -242,14 +314,10 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const token = GITHUB_TOKEN;
-    if (!token) throw new Error("GITHUB_TOKEN not configured");
+    if (!GITHUB_TOKEN) throw new Error("GITHUB_TOKEN not configured");
     if (!VERCEL_TOKEN) throw new Error("VERCEL_TOKEN not configured");
 
-    // Step 1: Copy repository
-    await copyRepo(src.owner, src.repo, dst.owner, dst.repo, token);
-
-    // Step 2: Deploy to Vercel
+    await copyRepo(src.owner, src.repo, dst.owner, dst.repo, GITHUB_TOKEN);
     const liveUrl = await deployToVercel(dst.owner, dst.repo, VERCEL_TOKEN);
 
     return new Response(
