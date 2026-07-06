@@ -1,23 +1,25 @@
 import { useState } from "react";
-import { Github, Rocket, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy } from "lucide-react";
+import { Github, Rocket, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy, Mail } from "lucide-react";
 
 type Status = "idle" | "copying" | "done" | "error";
 
 interface Result {
   copiedRepo: string;
   liveUrl: string;
+  folderPath: string;
 }
 
 export default function App() {
   const [sourceUrl, setSourceUrl] = useState("https://github.com/Krrish41/space-cargo-runner");
   const [targetUrl, setTargetUrl] = useState("https://github.com/bhavna-AI-stack/space-cargo");
+  const [email, setEmail] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   async function handleSubmit() {
-    if (!sourceUrl.trim() || !targetUrl.trim()) return;
+    if (!sourceUrl.trim() || !targetUrl.trim() || !email.trim()) return;
     setStatus("copying");
     setError(null);
     setResult(null);
@@ -32,7 +34,11 @@ export default function App() {
             Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ sourceUrl: sourceUrl.trim(), targetUrl: targetUrl.trim() }),
+          body: JSON.stringify({
+            sourceUrl: sourceUrl.trim(),
+            targetUrl: targetUrl.trim(),
+            email: email.trim()
+          }),
         }
       );
 
@@ -42,7 +48,11 @@ export default function App() {
         throw new Error(data.error ?? `Request failed (${res.status})`);
       }
 
-      setResult({ copiedRepo: data.copiedRepo, liveUrl: data.liveUrl });
+      setResult({
+        copiedRepo: data.copiedRepo,
+        liveUrl: data.liveUrl,
+        folderPath: data.folderPath
+      });
       setStatus("done");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -127,10 +137,31 @@ export default function App() {
             </p>
           </div>
 
+          {/* Email Input */}
+          <div className="mb-6">
+            <label className="block text-xs font-semibold text-white/60 uppercase tracking-widest mb-2">
+              Your Email <span className="text-white/30 normal-case">(creates a folder with this name)</span>
+            </label>
+            <div className="relative">
+              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={isLoading}
+                placeholder="you@example.com"
+                className="w-full bg-[#0d1117] border border-white/10 rounded-lg pl-10 pr-4 py-3 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30 focus:ring-1 focus:ring-white/20 transition disabled:opacity-50"
+              />
+            </div>
+            <p className="mt-2 text-xs text-white/30">
+              The source repo will be copied into a folder named after your email.
+            </p>
+          </div>
+
           {/* Submit Button */}
           <button
             onClick={handleSubmit}
-            disabled={isLoading || !sourceUrl.trim() || !targetUrl.trim()}
+            disabled={isLoading || !sourceUrl.trim() || !targetUrl.trim() || !email.trim()}
             className="w-full flex items-center justify-center gap-2.5 py-3.5 px-6 rounded-xl font-semibold text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
             style={{
               background: isLoading
@@ -168,6 +199,11 @@ export default function App() {
                 <span className="text-sm font-semibold text-emerald-400">Repo copied! Vercel deployment in progress…</span>
               </div>
               <p className="text-xs text-white/30 mb-3">The live URL will be active within a few minutes once Vercel finishes building.</p>
+              <ResultRow
+                label="Folder"
+                url={result.copiedRepo + "/tree/main/" + result.folderPath}
+                onCopy={() => copyUrl(result.copiedRepo + "/tree/main/" + result.folderPath)}
+              />
               <ResultRow
                 label="GitHub Repo"
                 url={result.copiedRepo}

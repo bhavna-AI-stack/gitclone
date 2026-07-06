@@ -28,6 +28,15 @@ function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
   }
 }
 
+function emailToFolder(email: string): string {
+  // Convert email to safe folder name: "user@example.com" -> "user_example.com"
+  return email
+    .toLowerCase()
+    .replace(/@/g, "_")
+    .replace(/[^a-z0-9_.-]/g, "")
+    .slice(0, 100);
+}
+
 // ── GitHub helpers ──────────────────────────────────────────────────────────
 
 const GH_BASE = "https://api.github.com";
@@ -140,6 +149,7 @@ async function copyBlobs(
   dstOwner: string,
   dstRepo: string,
   blobs: TreeItem[],
+  folderPrefix: string,
   token: string,
   batchSize = 6
 ): Promise<NewEntry[]> {
@@ -160,8 +170,9 @@ async function copyBlobs(
           token
         )) as { sha: string };
 
+        // Prepend folder prefix to path
         return {
-          path: item.path,
+          path: `${folderPrefix}/${item.path}`,
           mode: item.mode,
           type: "blob" as const,
           sha: newBlob.sha,
@@ -179,6 +190,7 @@ async function copyRepo(
   srcRepo: string,
   dstOwner: string,
   dstRepo: string,
+  folderName: string,
   token: string
 ): Promise<void> {
   // 1. Read source metadata + tree
@@ -202,24 +214,42 @@ async function copyRepo(
 
   const items = treeData.tree;
   const blobItems = items.filter((i) => i.type === "blob");
+  const treeItems = items.filter((i) => i.type === "tree");
 
   // 2. Ensure target repo exists and has at least one commit
   const dstBranch = await ensureRepoReady(dstOwner, dstRepo, srcBranch, token);
 
-  // 3. Copy all blobs in parallel batches
+  // 3. Copy all blobs in parallel batches, with folder prefix
   const newEntries = await copyBlobs(
     srcOwner,
     srcRepo,
     dstOwner,
     dstRepo,
     blobItems,
+    folderName,
     token
   );
 
-  // 4. Create tree, commit, update ref
+  // 4. Add tree entries for the folder structure (prefix all tree paths)
+  const newTreeEntries: Array<{ path: string; mode: string; type: string; sha?: string }> = [];
+
+  // Create implicit tree entries for the folder structure
+  const folders = new Set<string>();
+  for (const item of treeItems) {
+    folders.add(`${folderName}/${item.path}`);
+  }
+  // Also add the root folder
+  folders.add(folderName);
+
+  // Add blob entries
+  for (const entry of newEntries) {
+    newTreeEntries.push(entry);
+  }
+
+  // 5. Create tree, commit, update ref
   const newTree = (await ghPost(
     `/repos/${dstOwner}/${dstRepo}/git/trees`,
-    { tree: newEntries },
+    { tree: newTreeEntries },
     token
   )) as { sha: string };
 
@@ -236,7 +266,7 @@ async function copyRepo(
   const newCommit = (await ghPost(
     `/repos/${dstOwner}/${dstRepo}/git/commits`,
     {
-      message: `Copy from ${srcOwner}/${srcRepo}`,
+      message: `Copy from ${srcOwner}/${srcRepo} into folder ${folderName}`,
       tree: newTree.sha,
       parents: parentShas,
     },
@@ -320,14 +350,15 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { sourceUrl, targetUrl } = (await req.json()) as {
+    const { sourceUrl, targetUrl, email } = (await req.json()) as {
       sourceUrl?: string;
       targetUrl?: string;
+      email?: string;
     };
 
-    if (!sourceUrl || !targetUrl) {
+    if (!sourceUrl || !targetUrl || !email) {
       return new Response(
-        JSON.stringify({ error: "sourceUrl and targetUrl are required" }),
+        JSON.stringify({ error: "sourceUrl, targetUrl, and email are required" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -348,11 +379,22 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return new Response(
+        JSON.stringify({ error: "Invalid email format" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     if (!GITHUB_TOKEN) throw new Error("GITHUB_TOKEN not configured");
     if (!VERCEL_TOKEN) throw new Error("VERCEL_TOKEN not configured");
 
-    // Copy repo files
-    await copyRepo(src.owner, src.repo, dst.owner, dst.repo, GITHUB_TOKEN);
+    const folderName = emailToFolder(email);
+
+    // Copy repo files into the email-named folder
+    await copyRepo(src.owner, src.repo, dst.owner, dst.repo, folderName, GITHUB_TOKEN);
 
     // Create Vercel project (returns stable URL; deployment runs in background on Vercel)
     const liveUrl = await createVercelProject(dst.owner, dst.repo, VERCEL_TOKEN);
@@ -361,6 +403,7 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         success: true,
         copiedRepo: `https://github.com/${dst.owner}/${dst.repo}`,
+        folderPath: folderName,
         liveUrl,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
